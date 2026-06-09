@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>蝴蝶涂鸦</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      touch-action: none;
+      -webkit-touch-callout: none;
+      user-select: none;
+    }
+    #wrap {
+      position: relative;
+      width: 100%;
+      height: 100%;
+    }
+    canvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 100%;
+      height: 100%;
+    }
+    #canvasDraw { z-index: 1; }
+    #canvasFx { z-index: 2; pointer-events: none; }
+    .toolbar {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+      display: flex;
+      justify-content: center;
+      gap: 12px;
+      background: linear-gradient(transparent, rgba(0, 0, 0, 0.5));
+      z-index: 10;
+    }
+    .btn {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 999px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.15);
+      color: #fff;
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+    }
+    .btn:active { transform: scale(0.96); opacity: 0.85; }
+    .btn--primary {
+      background: linear-gradient(135deg, #f97316, #fb923c);
+      box-shadow: 0 4px 16px rgba(249, 115, 22, 0.35);
+    }
+    .hint {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: rgba(255, 255, 255, 0.4);
+      font-size: 15px;
+      pointer-events: none;
+      text-align: center;
+      line-height: 1.8;
+      z-index: 5;
+      transition: opacity 0.5s;
+    }
+    .hint.hidden { opacity: 0; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="canvasDraw"></canvas>
+    <canvas id="canvasFx"></canvas>
+  </div>
+  <p class="hint" id="hint">用手指画一个图案<br>松手后变成飞舞的蝴蝶</p>
+  <div class="toolbar">
+    <button class="btn" id="btnReset" type="button">Reset</button>
+    <button class="btn btn--primary" id="btnShare" type="button">Share</button>
+  </div>
+
+  <script>
+    const canvasDraw = document.getElementById('canvasDraw');
+    const canvasFx = document.getElementById('canvasFx');
+    const ctxDraw = canvasDraw.getContext('2d');
+    const ctxFx = canvasFx.getContext('2d');
+    const hint = document.getElementById('hint');
+
+    let w, h, dpr;
+    let drawing = false;
+    let currentPoints = [];
+    let shapes = [];
+    let particles = [];
+    let wingFrame = 0;
+
+    const COLORS = [
+      '#0000FF', '#0088FF', '#00FF88', '#00FFFF', '#8800FF',
+      '#FF0088', '#FF00FF', '#FF8800', '#FFFF00', '#88FF00',
+    ];
+
+    function resize() {
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      w = window.innerWidth;
+      h = window.innerHeight;
+      [canvasDraw, canvasFx].forEach(function (c) {
+        c.width = w * dpr;
+        c.height = h * dpr;
+        c.style.width = w + 'px';
+        c.style.height = h + 'px';
+      });
+      ctxDraw.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctxFx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function dist2(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return dx * dx + dy * dy;
+    }
+
+    function simplify(points, tolerance) {
+      if (points.length <= 2) return points.slice();
+      const tol2 = tolerance * tolerance;
+      let maxDist = 0;
+      let idx = 0;
+      const start = points[0];
+      const end = points[points.length - 1];
+      for (let i = 1; i < points.length - 1; i++) {
+        const p = points[i];
+        const num = Math.abs((end.y - start.y) * p.x - (end.x - start.x) * p.y + end.x * start.y - end.y * start.x);
+        const den = Math.sqrt(dist2(start, end)) || 1;
+        const d = num / den;
+        if (d > maxDist) {
+          maxDist = d;
+          idx = i;
+        }
+      }
+      if (maxDist > tolerance) {
+        const left = simplify(points.slice(0, idx + 1), tolerance);
+        const right = simplify(points.slice(idx), tolerance);
+        return left.slice(0, -1).concat(right);
+      }
+      return [start, end];
+    }
+
+    function normalizeShape(points) {
+      let minX = points[0].x, maxX = points[0].x;
+      let minY = points[0].y, maxY = points[0].y;
+      points.forEach(function (p) {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      });
+      const cx = (minX + maxX) * 0.5;
+      const cy = (minY + maxY) * 0.5;
+      const rel = points.map(function (p) {
+        return { x: p.x - cx, y: p.y - cy };
+      });
+      return {
+        rel: rel,
+        width: maxX - minX,
+        height: maxY - minY,
+        size: Math.max(maxX - minX, maxY - minY),
+        centerX: cx,
+        centerY: cy,
+      };
+    }
+
+    const MAX_BUTTERFLY_RATIO = 0.28;
+
+    function computeDisplayScale(width, height) {
+      const drawSize = Math.max(width, height, 1);
+      const maxSize = Math.min(w, h) * MAX_BUTTERFLY_RATIO;
+      return Math.min(1, maxSize / drawSize);
+    }
+
+    function pickTarget(margin) {
+      margin = margin || 40;
+      return {
+        x: margin + Math.random() * Math.max(w - margin * 2, 1),
+        y: margin + Math.random() * Math.max(h * 0.85 - margin * 2, 1),
+      };
+    }
+
+    function createShape(rawPoints) {
+      const simplified = simplify(rawPoints, 2);
+      if (simplified.length < 4) return null;
+
+      const norm = normalizeShape(simplified);
+      const displayScale = computeDisplayScale(norm.width, norm.height);
+      const margin = Math.max(norm.width, norm.height) * displayScale * 0.6 + 24;
+      const target = pickTarget(margin);
+      const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+
+      return {
+        raw: simplified.map(function (p) { return { x: p.x, y: p.y }; }),
+        rel: norm.rel.map(function (p) { return { x: p.x, y: p.y }; }),
+        width: norm.width,
+        height: norm.height,
+        size: norm.size,
+        color: color,
+        displayScale: displayScale,
+        margin: margin,
+        morph: 0,
+        lineAlpha: 1,
+        pos: { x: norm.centerX, y: norm.centerY },
+        from: { x: norm.centerX, y: norm.centerY },
+        to: target,
+        angle: Math.atan2(norm.centerY - target.y, norm.centerX - target.x) * 180 / Math.PI,
+        targetAngle: 0,
+        currentAngle: 90,
+        holding: false,
+        particleRate: Math.max(Math.floor(norm.size * displayScale * 0.15), 1),
+        particleTimer: 0,
+      };
+    }
+
+    function rotatePoint(x, y, deg) {
+      const rad = deg * Math.PI / 180;
+      return {
+        x: x * Math.cos(rad) - y * Math.sin(rad),
+        y: x * Math.sin(rad) + y * Math.cos(rad),
+      };
+    }
+
+    function easeCos(t) {
+      return (Math.cos((1 - t) * Math.PI) + 1) / 2;
+    }
+
+    function drawPath(ctx, points, close) {
+      if (points.length < 2) return;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(points[i].x, points[i].y);
+      }
+      if (close) ctx.closePath();
+    }
+
+    function clampPos(x, y, margin) {
+      return {
+        x: Math.max(margin, Math.min(w - margin, x)),
+        y: Math.max(margin, Math.min(h * 0.85 - margin, y)),
+      };
+    }
+
+    function getFlyT(morphT) {
+      if (morphT <= 1) return morphT;
+      return morphT - 1;
+    }
+
+    function getScreenPoints(shape, morphT, wingT) {
+      const flap = (Math.cos(wingT * Math.PI * 2 * 4) + 1) / 2;
+      const flapAmt = 0.8 * flap + 0.2;
+      const halfW = shape.width * 0.5 || 1;
+      const flyT = easeCos(Math.min(getFlyT(morphT), 1));
+      const appear = Math.min(Math.max(morphT, 0), 1);
+      const scale = shape.displayScale * (0.7 + appear * 0.3);
+      const angle = shape.currentAngle + (shape.targetAngle - shape.currentAngle) * appear;
+
+      let posX = shape.from.x + (shape.to.x - shape.from.x) * flyT;
+      let posY = shape.from.y + (shape.to.y - shape.from.y) * flyT;
+      const clamped = clampPos(posX, posY, shape.margin);
+      posX = clamped.x;
+      posY = clamped.y;
+
+      return shape.rel.map(function (p) {
+        let x = p.x;
+        let y = p.y * (1 + 0.35 * (1 - flapAmt) * Math.abs(x / halfW));
+        x *= flapAmt;
+        const r = rotatePoint(x * scale, y * scale, angle + 270);
+        return { x: r.x + posX, y: r.y + posY };
+      });
+    }
+
+    function drawButterflyShape(ctx, shape, morphT, wingT) {
+      const pts = getScreenPoints(shape, morphT, wingT);
+      if (pts.length < 2) return;
+
+      const alpha = morphT >= 1 ? 1 : morphT;
+      drawPath(ctx, pts, true);
+
+      for (let i = 4; i >= 1; i--) {
+        ctx.lineWidth = i * 1.5;
+        ctx.strokeStyle = shape.color;
+        ctx.globalAlpha = alpha * 0.15;
+        ctx.stroke();
+      }
+
+      ctx.fillStyle = '#ffffff';
+      ctx.globalAlpha = alpha * 0.95;
+      ctx.fill();
+
+      ctx.fillStyle = shape.color;
+      ctx.globalAlpha = alpha * 0.35;
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    function emitParticles(shape, morphT, wingT) {
+      if (morphT < 0.8) return;
+      shape.particleTimer += 1;
+      if (shape.particleTimer % 2 !== 0) return;
+
+      const pts = getScreenPoints(shape, morphT, wingT);
+      const count = Math.min(shape.particleRate, 8);
+      for (let i = 0; i < count; i++) {
+        const p = pts[Math.floor(Math.random() * pts.length)];
+        const speed = 0.5 + Math.random() * 2;
+        const dir = Math.random() * Math.PI * 2;
+        particles.push({
+          x: p.x,
+          y: p.y,
+          vx: Math.cos(dir) * speed,
+          vy: Math.sin(dir) * speed - 0.5,
+          life: 1,
+          decay: 0.015 + Math.random() * 0.02,
+          size: 2 + Math.random() * 4,
+          color: shape.color,
+        });
+      }
+    }
+
+    function updateShape(shape, dt) {
+      if (shape.morph < 1) {
+        shape.morph += dt * 0.5;
+        shape.lineAlpha = 1 - shape.morph;
+      } else {
+        shape.lineAlpha = 0;
+        shape.morph += dt * 0.12;
+        if (shape.morph >= 2) {
+          shape.currentAngle = shape.targetAngle;
+          shape.from = { x: shape.to.x, y: shape.to.y };
+          shape.to = pickTarget(shape.margin);
+          shape.targetAngle = Math.atan2(
+            shape.from.y - shape.to.y,
+            shape.from.x - shape.to.x
+          ) * 180 / Math.PI;
+          shape.morph = 1;
+        }
+      }
+    }
+
+    function drawMorphLine(ctx, shape) {
+      if (shape.lineAlpha <= 0 || shape.morph >= 1 || shape.raw.length < 2) return;
+      drawPath(ctx, shape.raw, false);
+      ctx.strokeStyle = 'rgba(255,255,255,' + shape.lineAlpha + ')';
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.stroke();
+    }
+
+    function updateParticles() {
+      particles = particles.filter(function (p) {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy += 0.02;
+        p.vx *= 0.98;
+        p.life -= p.decay;
+        return p.life > 0;
+      });
+    }
+
+    function drawParticles(ctx) {
+      ctx.globalCompositeOperation = 'lighter';
+      particles.forEach(function (p) {
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fillStyle = p.color;
+        ctx.globalAlpha = p.life * 0.6;
+        ctx.fill();
+      });
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = 1;
+    }
+
+    function drawCurrentStroke() {
+      if (currentPoints.length < 2) return;
+      drawPath(ctxDraw, currentPoints, false);
+      ctxDraw.strokeStyle = 'rgba(255,255,255,0.9)';
+      ctxDraw.lineWidth = 3;
+      ctxDraw.lineCap = 'round';
+      ctxDraw.lineJoin = 'round';
+      ctxDraw.stroke();
+    }
+
+    function loop() {
+      const dt = 1 / 60;
+      wingFrame = (wingFrame + 1) % 40;
+      const wingT = (wingFrame + 1) / 40;
+
+      ctxDraw.clearRect(0, 0, w, h);
+      ctxFx.clearRect(0, 0, w, h);
+
+      shapes.forEach(function (shape) {
+        updateShape(shape, dt);
+        drawMorphLine(ctxDraw, shape);
+        if (shape.morph >= 0.3) {
+          drawButterflyShape(ctxDraw, shape, shape.morph, wingT);
+          emitParticles(shape, shape.morph, wingT);
+        }
+      });
+
+      drawCurrentStroke();
+      updateParticles();
+      drawParticles(ctxFx);
+
+      requestAnimationFrame(loop);
+    }
+
+    function finishStroke() {
+      if (currentPoints.length < 6) {
+        currentPoints = [];
+        return;
+      }
+      hint.classList.add('hidden');
+      const shape = createShape(currentPoints);
+      currentPoints = [];
+      if (shape) shapes.push(shape);
+    }
+
+    function getPos(e) {
+      const rect = canvasDraw.getBoundingClientRect();
+      if (e.touches && e.touches.length) {
+        return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
+      }
+      return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    }
+
+    function onStart(e) {
+      e.preventDefault();
+      drawing = true;
+      currentPoints = [getPos(e)];
+    }
+
+    function onMove(e) {
+      if (!drawing) return;
+      e.preventDefault();
+      const p = getPos(e);
+      const last = currentPoints[currentPoints.length - 1];
+      if (!last || dist2(last, p) > 4) {
+        currentPoints.push(p);
+      }
+    }
+
+    function onEnd(e) {
+      if (!drawing) return;
+      e.preventDefault();
+      drawing = false;
+      finishStroke();
+    }
+
+    canvasDraw.addEventListener('mousedown', onStart);
+    canvasDraw.addEventListener('mousemove', onMove);
+    canvasDraw.addEventListener('mouseup', onEnd);
+    canvasDraw.addEventListener('mouseleave', onEnd);
+    canvasDraw.addEventListener('touchstart', onStart, { passive: false });
+    canvasDraw.addEventListener('touchmove', onMove, { passive: false });
+    canvasDraw.addEventListener('touchend', onEnd, { passive: false });
+
+    document.getElementById('btnReset').onclick = function () {
+      shapes = [];
+      particles = [];
+      currentPoints = [];
+      drawing = false;
+      ctxDraw.clearRect(0, 0, w, h);
+      ctxFx.clearRect(0, 0, w, h);
+      hint.classList.remove('hidden');
+    };
+
+    document.getElementById('btnShare').onclick = async function () {
+      try {
+        const merged = document.createElement('canvas');
+        merged.width = canvasDraw.width;
+        merged.height = canvasDraw.height;
+        const mctx = merged.getContext('2d');
+        mctx.drawImage(canvasDraw, 0, 0);
+        mctx.drawImage(canvasFx, 0, 0);
+        const dataUrl = merged.toDataURL('image/png');
+        if (navigator.share && navigator.canShare) {
+          const blob = await (await fetch(dataUrl)).blob();
+          const file = new File([blob], 'butterfly.png', { type: 'image/png' });
+          if (navigator.canShare({ files: [file] })) {
+            await navigator.share({ files: [file], title: '蝴蝶涂鸦' });
+            return;
+          }
+        }
+        const a = document.createElement('a');
+        a.href = dataUrl;
+        a.download = 'butterfly.png';
+        a.click();
+      } catch (err) {
+        alert('分享失败，请截图保存');
+      }
+    };
+
+    window.addEventListener('resize', resize);
+    resize();
+    loop();
+  </script>
+</body>
+</html>
